@@ -42,7 +42,7 @@ here = os.path.dirname(__file__)
 
 import jupyterhub
 from . import handlers, apihandlers
-from .handlers.static import CacheControlStaticFilesHandler
+from .handlers.static import CacheControlStaticFilesHandler, LogoHandler
 
 from . import orm
 from .user import User, UserDict
@@ -86,6 +86,9 @@ flags = {
         "generate default config file"),
     'no-db': ({'JupyterHub': {'db_url': 'sqlite:///:memory:'}},
         "disable persisting state database to disk"
+    ),
+    'no-ssl': ({'JupyterHub': {'confirm_no_ssl': True}},
+        "Allow JupyterHub to run without SSL (SSL termination should be happening elsewhere)."
     ),
 }
 
@@ -208,7 +211,12 @@ class JupyterHub(Application):
 
     def _template_paths_default(self):
         return [os.path.join(self.data_files_path, 'templates')]
-
+    
+    confirm_no_ssl = Bool(False, config=True,
+        help="""Confirm that JupyterHub should be run without SSL.
+        This is **NOT RECOMMENDED** unless SSL termination is being handled by another layer.
+        """
+    )
     ssl_key = Unicode('', config=True,
         help="""Path to SSL key file for the public facing interface of the proxy
         
@@ -230,6 +238,11 @@ class JupyterHub(Application):
     base_url = URLPrefix('/', config=True,
         help="The base URL of the entire application"
     )
+    logo_file = Unicode('', config=True,
+        help="Specify path to a logo image to override the Jupyter logo in the banner."
+    )
+    def _logo_file_default(self):
+        return os.path.join(self.data_files_path, 'static', 'images', 'jupyter.png')
     
     jinja_environment_options = Dict(config=True,
         help="Supply extra arguments that will be passed to Jinja environment."
@@ -260,7 +273,7 @@ class JupyterHub(Application):
             token = orm.new_token()
         return token
     
-    proxy_api_ip = Unicode('localhost', config=True,
+    proxy_api_ip = Unicode('127.0.0.1', config=True,
         help="The ip for the proxy API handlers"
     )
     proxy_api_port = Integer(config=True,
@@ -272,7 +285,7 @@ class JupyterHub(Application):
     hub_port = Integer(8081, config=True,
         help="The port for this process"
     )
-    hub_ip = Unicode('localhost', config=True,
+    hub_ip = Unicode('127.0.0.1', config=True,
         help="The ip for this process"
     )
     
@@ -475,6 +488,8 @@ class JupyterHub(Application):
         # set default handlers
         h.extend(handlers.default_handlers)
         h.extend(apihandlers.default_handlers)
+        
+        h.append((r'/logo', LogoHandler, {'path': self.logo_file}))
         self.handlers = self.add_url_prefix(self.hub_prefix, h)
         # some extra handlers, outside hub_prefix
         self.handlers.extend([
@@ -630,7 +645,13 @@ class JupyterHub(Application):
                 "\nUse Authenticator.admin_users instead."
             )
             self.authenticator.admin_users = self.admin_users
-        admin_users = self.authenticator.admin_users
+        admin_users = [
+            self.authenticator.normalize_username(name)
+            for name in self.authenticator.admin_users
+        ]
+        for username in admin_users:
+            if not self.authenticator.validate_username(username):
+                raise ValueError("username %r is not valid" % username)
         
         if not admin_users:
             self.log.warning("No admin users, admin interface will be unavailable.")
@@ -651,7 +672,13 @@ class JupyterHub(Application):
         # the admin_users config variable will never be used after this point.
         # only the database values will be referenced.
 
-        whitelist = self.authenticator.whitelist
+        whitelist = [
+            self.authenticator.normalize_username(name)
+            for name in self.authenticator.whitelist
+        ]
+        for username in whitelist:
+            if not self.authenticator.validate_username(username):
+                raise ValueError("username %r is not valid" % username)
 
         if not whitelist:
             self.log.info("Not using whitelist. Any authenticated user will be allowed.")
@@ -671,7 +698,7 @@ class JupyterHub(Application):
             # but changes to the whitelist can occur in the database,
             # and persist across sessions.
             for user in db.query(orm.User):
-                whitelist.add(user.name)
+                self.authenticator.whitelist.add(user.name)
 
         # The whitelist set and the users in the db are now the same.
         # From this point on, any user changes should be done simultaneously
@@ -788,6 +815,18 @@ class JupyterHub(Application):
             cmd.extend(['--ssl-key', self.ssl_key])
         if self.ssl_cert:
             cmd.extend(['--ssl-cert', self.ssl_cert])
+        # Require SSL to be used or `--no-ssl` to confirm no SSL on 
+        if ' --ssl' not in ' '.join(cmd):
+            if self.confirm_no_ssl:
+                self.log.warning("Running JupyterHub without SSL."
+                    " There better be SSL termination happening somewhere else...")
+            else:
+                self.log.error(
+                    "Refusing to run JuptyterHub without SSL."
+                    " If you are terminating SSL in another layer,"
+                    " pass --no-ssl to tell JupyterHub to allow the proxy to listen on HTTP."
+                )
+                self.exit(1)
         self.log.info("Starting proxy @ %s", self.proxy.public_server.bind_url)
         self.log.debug("Proxy cmd: %s", cmd)
         try:
@@ -834,9 +873,13 @@ class JupyterHub(Application):
     def init_tornado_settings(self):
         """Set up the tornado settings dict."""
         base_url = self.hub.server.base_url
+        jinja_options = dict(
+            autoescape=True,
+        )
+        jinja_options.update(self.jinja_environment_options)
         jinja_env = Environment(
             loader=FileSystemLoader(self.template_paths),
-            **self.jinja_environment_options
+            **jinja_options
         )
         
         login_url = self.authenticator.login_url(base_url)

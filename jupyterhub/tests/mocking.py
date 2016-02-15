@@ -53,8 +53,8 @@ class SlowSpawner(MockSpawner):
     
     @gen.coroutine
     def start(self):
-        yield gen.sleep(2)
         yield super().start()
+        yield gen.sleep(2)
     
     @gen.coroutine
     def stop(self):
@@ -83,6 +83,8 @@ class FormSpawner(MockSpawner):
             options['bounds'] = [int(i) for i in form_data['bounds']]
         if 'energy' in form_data:
             options['energy'] = form_data['energy'][0]
+        if 'hello_file' in form_data:
+            options['hello'] = form_data['hello_file'][0]
         return options
 
 
@@ -97,16 +99,19 @@ class MockPAMAuthenticator(PAMAuthenticator):
     def authenticate(self, *args, **kwargs):
         with mock.patch.multiple('pamela',
                 authenticate=mock_authenticate,
-                open_session=mock_open_session):
+                open_session=mock_open_session,
+                close_session=mock_open_session,
+                ):
             return super(MockPAMAuthenticator, self).authenticate(*args, **kwargs)
 
 class MockHub(JupyterHub):
     """Hub with various mock bits"""
 
     db_file = None
+    confirm_no_ssl = True
     
     def _ip_default(self):
-        return 'localhost'
+        return '127.0.0.1'
     
     def _authenticator_class_default(self):
         return MockPAMAuthenticator

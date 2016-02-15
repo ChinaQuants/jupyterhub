@@ -41,7 +41,7 @@ class Spawner(LoggingConfigurable):
     hub = Any()
     authenticator = Any()
     api_token = Unicode()
-    ip = Unicode('localhost', config=True,
+    ip = Unicode('127.0.0.1', config=True,
         help="The IP address (or hostname) the single-user server should listen on"
     )
     start_timeout = Integer(60, config=True,
@@ -136,6 +136,7 @@ class Spawner(LoggingConfigurable):
         help="""The notebook directory for the single-user server
         
         `~` will be expanded to the user's home directory
+        `%U` will be expanded to the user's username
         """
     )
     
@@ -163,7 +164,7 @@ class Spawner(LoggingConfigurable):
         """store the state necessary for load_state
         
         A black box of extra state for custom spawners.
-        Should call `super`.
+        Subclasses should call `super`.
         
         Returns
         -------
@@ -204,6 +205,7 @@ class Spawner(LoggingConfigurable):
         if self.ip:
             args.append('--ip=%s' % self.ip)
         if self.notebook_dir:
+            self.notebook_dir = self.notebook_dir.replace("%U",self.user.name)
             args.append('--notebook-dir=%s' % self.notebook_dir)
         if self.debug:
             args.append('--debug')
@@ -318,9 +320,6 @@ def set_user_setuid(username):
     gids = [ g.gr_gid for g in grp.getgrall() if username in g.gr_mem ]
     
     def preexec():
-        # don't forward signals
-        os.setpgrp()
-        
         # set the user and group
         os.setgid(gid)
         try:
@@ -336,7 +335,12 @@ def set_user_setuid(username):
 
 
 class LocalProcessSpawner(Spawner):
-    """A Spawner that just uses Popen to start local processes."""
+    """A Spawner that just uses Popen to start local processes as users.
+    
+    Requires users to exist on the local system.
+    
+    This is the default spawner for JupyterHub.
+    """
     
     INTERRUPT_TIMEOUT = Integer(10, config=True,
         help="Seconds to wait for process to halt after SIGINT before proceeding to SIGTERM"
@@ -405,6 +409,7 @@ class LocalProcessSpawner(Spawner):
         self.log.info("Spawning %s", ' '.join(pipes.quote(s) for s in cmd))
         self.proc = Popen(cmd, env=env,
             preexec_fn=self.make_preexec_fn(self.user.name),
+            start_new_session=True, # don't forward signals
         )
         self.pid = self.proc.pid
     

@@ -33,12 +33,24 @@ class UserListAPIHandler(APIHandler):
         admin = data.get('admin', False)
         
         to_create = []
+        invalid_names = []
         for name in usernames:
+            name = self.authenticator.normalize_username(name)
+            if not self.authenticator.validate_username(name):
+                invalid_names.append(name)
+                continue
             user = self.find_user(name)
             if user is not None:
                 self.log.warn("User %s already exists" % name)
             else:
                 to_create.append(name)
+        
+        if invalid_names:
+            if len(invalid_names) == 1:
+                msg = "Invalid username: %s" % invalid_names[0]
+            else:
+                msg = "Invalid usernames: %s" % ', '.join(invalid_names)
+            raise web.HTTPError(400, msg)
         
         if not to_create:
             raise web.HTTPError(400, "All %i users already exist" % len(usernames))
@@ -51,11 +63,10 @@ class UserListAPIHandler(APIHandler):
                 self.db.commit()
             try:
                 yield gen.maybe_future(self.authenticator.add_user(user))
-            except Exception:
+            except Exception as e:
                 self.log.error("Failed to create user: %s" % name, exc_info=True)
-                self.db.delete(user)
-                self.db.commit()
-                raise web.HTTPError(400, "Failed to create user: %s" % name)
+                del self.users[user]
+                raise web.HTTPError(400, "Failed to create user %s: %s" % (name, str(e)))
             else:
                 created.append(user)
         
@@ -105,9 +116,7 @@ class UserAPIHandler(APIHandler):
         except Exception:
             self.log.error("Failed to create user: %s" % name, exc_info=True)
             # remove from registry
-            self.users.pop(user.id, None)
-            self.db.delete(user)
-            self.db.commit()
+            del self.users[user]
             raise web.HTTPError(400, "Failed to create user: %s" % name)
         
         self.write(json.dumps(self.user_model(user)))
@@ -130,10 +139,7 @@ class UserAPIHandler(APIHandler):
         
         yield gen.maybe_future(self.authenticator.delete_user(user))
         # remove from registry
-        self.users.pop(user.id, None)
-        # remove from the db
-        self.db.delete(user)
-        self.db.commit()
+        del self.users[user]
         
         self.set_status(204)
     

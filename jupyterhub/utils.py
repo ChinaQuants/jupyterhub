@@ -6,10 +6,12 @@
 from binascii import b2a_hex
 import errno
 import hashlib
+from hmac import compare_digest
 import os
 import socket
+from threading import Thread
 import uuid
-from hmac import compare_digest
+import warnings
 
 from tornado import web, gen, ioloop
 from tornado.httpclient import AsyncHTTPClient, HTTPError
@@ -192,3 +194,4 @@ def url_path_join(*pieces):
         result = '/'
 
     return result
+

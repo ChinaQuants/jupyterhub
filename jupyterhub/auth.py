@@ -1,4 +1,4 @@
-"""Simple PAM authenticator"""
+"""Base Authenticator class and the default PAM Authenticator"""
 
 # Copyright (c) IPython Development Team.
 # Distributed under the terms of the Modified BSD License.
@@ -6,15 +6,16 @@
 from grp import getgrnam
 import pipes
 import pwd
+import re
 from shutil import which
 import sys
-from subprocess import check_call
+from subprocess import Popen, PIPE, STDOUT
 
 from tornado import gen
 import pamela
 
 from traitlets.config import LoggingConfigurable
-from traitlets import Bool, Set, Unicode, Any
+from traitlets import Bool, Set, Unicode, Dict, Any
 
 from .handlers.login import LoginHandler
 from .utils import url_path_join
@@ -23,7 +24,8 @@ from .traitlets import Command
 class Authenticator(LoggingConfigurable):
     """A class for authentication.
     
-    The API is one method, `authenticate`, a tornado gen.coroutine.
+    The primary API is one method, `authenticate`, a tornado coroutine
+    for authenticating users.
     """
     
     db = Any()
@@ -53,6 +55,88 @@ class Authenticator(LoggingConfigurable):
         """
     )
     
+    username_pattern = Unicode(config=True,
+        help="""Regular expression pattern for validating usernames.
+        
+        If not defined: allow any username.
+        """
+    )
+    def _username_pattern_changed(self, name, old, new):
+        if not new:
+            self.username_regex = None
+        self.username_regex = re.compile(new)
+    
+    username_regex = Any()
+    
+    def validate_username(self, username):
+        """Validate a (normalized) username.
+        
+        Return True if username is valid, False otherwise.
+        """
+        if not self.username_regex:
+            return True
+        return bool(self.username_regex.match(username))
+    
+    username_map = Dict(config=True,
+        help="""Dictionary mapping authenticator usernames to JupyterHub users.
+        
+        Can be used to map OAuth service names to local users, for instance.
+        
+        Used in normalize_username.
+        """
+    )
+    
+    def normalize_username(self, username):
+        """Normalize a username.
+        
+        Override in subclasses if usernames should have some normalization.
+        Default: cast to lowercase, lookup in username_map.
+        """
+        username = username.lower()
+        username = self.username_map.get(username, username)
+        return username
+    
+    def check_whitelist(self, username):
+        """Check a username against our whitelist.
+        
+        Return True if username is allowed, False otherwise.
+        No whitelist means any username should be allowed.
+        
+        Names are normalized *before* being checked against the whitelist.
+        """
+        if not self.whitelist:
+            # No whitelist means any name is allowed
+            return True
+        return username in self.whitelist
+    
+    @gen.coroutine
+    def get_authenticated_user(self, handler, data):
+        """This is the outer API for authenticating a user.
+        
+        This calls `authenticate`, which should be overridden in subclasses,
+        normalizes the username if any normalization should be done,
+        and then validates the name in the whitelist.
+        
+        Subclasses should not need to override this method.
+        The various stages can be overridden separately:
+        
+        - authenticate turns formdata into a username
+        - normalize_username normalizes the username
+        - check_whitelist checks against the user whitelist
+        """
+        username = yield self.authenticate(handler, data)
+        if username is None:
+            return
+        username = self.normalize_username(username)
+        if not self.validate_username(username):
+            self.log.warning("Disallowing invalid username %r.", username)
+            return
+        if self.check_whitelist(username):
+            return username
+        else:
+            self.log.warning("User %r not in whitelist.", username)
+            return
+    
     @gen.coroutine
     def authenticate(self, handler, data):
         """Authenticate a user with login form data.
@@ -60,6 +144,16 @@ class Authenticator(LoggingConfigurable):
         This must be a tornado gen.coroutine.
         It must return the username on successful authentication,
         and return None on failed authentication.
+        
+        Checking the whitelist is handled separately by the caller.
+
+        Args:
+            handler (tornado.web.RequestHandler): the current request handler
+            data (dict): The formdata of the login form.
+                         The default form has 'username' and 'password' fields.
+        Return:
+            str: the username of the authenticated user
+            None: Authentication failed
         """
 
     def pre_spawn_start(self, user, spawner):
@@ -74,21 +168,20 @@ class Authenticator(LoggingConfigurable):
         Can be used to do auth-related cleanup, e.g. closing PAM sessions.
         """
     
-    def check_whitelist(self, user):
-        """
-        Return True if the whitelist is empty or user is in the whitelist.
-        """
-        # Parens aren't necessary here, but they make this easier to parse.
-        return (not self.whitelist) or (user in self.whitelist)
-
     def add_user(self, user):
         """Add a new user
         
         By default, this just adds the user to the whitelist.
         
         Subclasses may do more extensive things,
-        such as adding actual unix users.
+        such as adding actual unix users,
+        but they should call super to ensure the whitelist is updated.
+
+        Args:
+            user (User): The User wrapper object
         """
+        if not self.validate_username(user.name):
+            raise ValueError("Invalid username: %s" % user.name)
         if self.whitelist:
             self.whitelist.add(user.name)
     
@@ -96,29 +189,60 @@ class Authenticator(LoggingConfigurable):
         """Triggered when a user is deleted.
         
         Removes the user from the whitelist.
+        Subclasses should call super to ensure the whitelist is updated.
+        
+        Args:
+            user (User): The User wrapper object
         """
         self.whitelist.discard(user.name)
     
     def login_url(self, base_url):
-        """Override to register a custom login handler"""
+        """Override to register a custom login handler
+        
+        Generally used in combination with get_handlers.
+        
+        Args:
+            base_url (str): the base URL of the Hub (e.g. /hub/)
+        
+        Returns:
+            str: The login URL, e.g. '/hub/login'
+        
+        """
         return url_path_join(base_url, 'login')
     
     def logout_url(self, base_url):
-        """Override to register a custom logout handler"""
+        """Override to register a custom logout handler.
+        
+        Generally used in combination with get_handlers.
+        
+        Args:
+            base_url (str): the base URL of the Hub (e.g. /hub/)
+        
+        Returns:
+            str: The logout URL, e.g. '/hub/logout'
+        """
         return url_path_join(base_url, 'logout')
     
     def get_handlers(self, app):
         """Return any custom handlers the authenticator needs to register
         
-        (e.g. for OAuth)
+        (e.g. for OAuth).
+        
+        Args:
+            app (JupyterHub Application):
+                the application object, in case it needs to be accessed for info.
+        Returns:
+            list: list of ``('/url', Handler)`` tuples passed to tornado.
+                The Hub prefix is added to any URLs.
+        
         """
         return [
             ('/login', LoginHandler),
         ]
 
 class LocalAuthenticator(Authenticator):
-    """Base class for Authenticators that work with local *ix users
-    
+    """Base class for Authenticators that work with local Linux/UNIX users
+
     Checks for local users, and can attempt to create them if they exist.
     """
     
@@ -192,10 +316,7 @@ class LocalAuthenticator(Authenticator):
     def add_user(self, user):
         """Add a new user
         
-        By default, this just adds the user to the whitelist.
-        
-        Subclasses may do more extensive things,
-        such as adding actual unix users.
+        If self.create_system_users, the user will attempt to be created.
         """
         user_exists = yield gen.maybe_future(self.system_user_exists(user))
         if not user_exists:
@@ -215,17 +336,21 @@ class LocalAuthenticator(Authenticator):
             return False
         else:
             return True
-    
+
     def add_system_user(self, user):
-        """Create a new *ix user on the system. Works on FreeBSD and Linux, at least."""
+        """Create a new Linux/UNIX user on the system. Works on FreeBSD and Linux, at least."""
         name = user.name
         cmd = [ arg.replace('USERNAME', name) for arg in self.add_user_cmd ] + [name]
         self.log.info("Creating user: %s", ' '.join(map(pipes.quote, cmd)))
-        check_call(cmd)
+        p = Popen(cmd, stdout=PIPE, stderr=STDOUT)
+        p.wait()
+        if p.returncode:
+            err = p.stdout.read().decode('utf8', 'replace')
+            raise RuntimeError("Failed to create system user %s: %s" % (name, err))
 
 
 class PAMAuthenticator(LocalAuthenticator):
-    """Authenticate local *ix users with PAM"""
+    """Authenticate local Linux/UNIX users with PAM"""
     encoding = Unicode('utf8', config=True,
         help="""The encoding to use for PAM"""
     )
@@ -240,8 +365,6 @@ class PAMAuthenticator(LocalAuthenticator):
         Return None otherwise.
         """
         username = data['username']
-        if not self.check_whitelist(username):
-            return
         try:
             pamela.authenticate(username, data['password'], service=self.service)
         except pamela.PAMError as e:

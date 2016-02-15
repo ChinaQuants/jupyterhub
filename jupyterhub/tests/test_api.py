@@ -209,6 +209,17 @@ def test_add_multi_user_bad(app):
     r = api_request(app, 'users', method='post', data='[]')
     assert r.status_code == 400
 
+
+def test_add_multi_user_invalid(app):
+    app.authenticator.username_pattern = r'w.*'
+    r = api_request(app, 'users', method='post',
+        data=json.dumps({'usernames': ['Willow', 'Andrew', 'Tara']})
+    )
+    app.authenticator.username_pattern = ''
+    assert r.status_code == 400
+    assert r.json()['message'] == 'Invalid usernames: andrew, tara'
+
+
 def test_add_multi_user(app):
     db = app.db
     names = ['a', 'b']
@@ -359,7 +370,8 @@ def test_spawn(app, io_loop):
     assert status == 0
 
 def test_slow_spawn(app, io_loop):
-    app.tornado_application.settings['spawner_class'] = mocking.SlowSpawner
+    # app.tornado_application.settings['spawner_class'] = mocking.SlowSpawner
+    app.tornado_settings['spawner_class'] = mocking.SlowSpawner
     app.tornado_application.settings['slow_spawn_timeout'] = 0
     app.tornado_application.settings['slow_stop_timeout'] = 0
 

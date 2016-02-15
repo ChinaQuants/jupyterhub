@@ -30,7 +30,14 @@ class UserDict(dict):
     def db(self):
         return self.db_factory()
     
+    def __contains__(self, key):
+        if isinstance(key, (User, orm.User)):
+            key = key.id
+        return dict.__contains__(self, key)
+    
     def __getitem__(self, key):
+        if isinstance(key, User):
+            key = key.id
         if isinstance(key, orm.User):
             # users[orm_user] returns User(orm_user)
             orm_user = key
@@ -50,6 +57,14 @@ class UserDict(dict):
             return dict.__getitem__(self, id)
         else:
             raise KeyError(repr(key))
+    
+    def __delitem__(self, key):
+        user = self[key]
+        user_id = user.id
+        db = self.db
+        db.delete(user.orm_user)
+        db.commit()
+        dict.__delitem__(self, user_id)
 
 
 class User(HasTraits):
@@ -70,6 +85,7 @@ class User(HasTraits):
         if self.orm_user:
             id = self.orm_user.id
             self.orm_user = new.query(orm.User).filter(orm.User.id==id).first()
+        self.spawner.db = self.db
     
     orm_user = None
     spawner = None
@@ -162,6 +178,8 @@ class User(HasTraits):
         # wait for spawner.start to return
         try:
             f = spawner.start()
+            # commit any changes in spawner.start (always commit db changes before yield)
+            db.commit()
             yield gen.with_timeout(timedelta(seconds=spawner.start_timeout), f)
         except Exception as e:
             if isinstance(e, gen.TimeoutError):
